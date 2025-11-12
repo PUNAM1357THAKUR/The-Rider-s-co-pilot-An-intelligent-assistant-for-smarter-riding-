@@ -1,0 +1,2 @@
+# The-Rider-s-co-pilot-An-intelligent-assistant-for-smarter-riding-
+This project is a Raspberry Pi-based Smart Rider Safety System designed to enhance motorcycle safety by verifying critical safety conditions before allowing ignition. The system evaluates three critical safety parameters: helmet detection using an IR sensor, alcohol detection using MQ3 and CO₂ sensors, and drowsiness detection using OpenCV.
