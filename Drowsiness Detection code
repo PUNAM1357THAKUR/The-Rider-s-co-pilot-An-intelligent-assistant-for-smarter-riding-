@@ -1,0 +1,265 @@
+Drowsiness Detection Code
+import cv2
+import dlib
+import numpy as np
+from scipy.spatial import distance
+from collections import deque
+
+# ---------------- CONFIG/TUNING ----------------
+PREDICTOR_PATH = r"C:\Users\Punam Thakur\PycharmProjects\OpenCVtutorial\shape_predictor_68_face_landmarks.dat\shape_predictor_68_face_landmarks.dat"
+
+EYE_AR_THRESH = 0.25
+EYE_AR_CONSEC_FRAMES = 15
+PERM_EYE_THRESH = 0.17
+PERM_EYE_FRAMES = 50
+
+MAR_THRESH = 0.60
+MAR_CONSEC_FRAMES = 15
+
+SMOOTHING_WINDOW = 8
+
+# ---------------- Helpers ----------------
+def eye_aspect_ratio(eye):
+    """
+    Returns EAR (float) or None if invalid (e.g., degenerate points).
+    eye: 6x2 array
+    """
+    try:
+        A = distance.euclidean(eye[1], eye[5])
+        B = distance.euclidean(eye[2], eye[4])
+        C = distance.euclidean(eye[0], eye[3])
+        if C <= 1e-3:  # too small / invalid
+            return None
+        return (A + B) / (2.0 * C)
+    except Exception:
+        return None
+
+def mouth_aspect_ratio(inner_mouth):
+    """
+    Returns MAR (float) or None if invalid.
+    inner_mouth: 8x2 array (points 60..67)
+    """
+    try:
+        A = distance.euclidean(inner_mouth[1], inner_mouth[7])  # 61,67
+        B = distance.euclidean(inner_mouth[2], inner_mouth[6])  # 62,66
+        C = distance.euclidean(inner_mouth[3], inner_mouth[5])  # 63,65
+        D = distance.euclidean(inner_mouth[0], inner_mouth[4])  # 60,64 horizontal
+        # If mouth width D is too small, treat as invalid measurement
+        if D <= 1e-3:
+            return None
+        return (A + B + C) / (2.0 * D)
+    except Exception:
+        return None
+
+# ---------------- Init detectors ----------------
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor(PREDICTOR_PATH)
+
+LEFT_EYE = list(range(42, 48))
+RIGHT_EYE = list(range(36, 42))
+INNER_MOUTH = list(range(60, 68))
+
+# smoothing buffers only store valid readings
+left_ear_deque = deque(maxlen=SMOOTHING_WINDOW)
+right_ear_deque = deque(maxlen=SMOOTHING_WINDOW)
+mar_deque = deque(maxlen=SMOOTHING_WINDOW)
+
+# state
+COUNTER = 0
+ALARM_ON = False
+
+left_perm_counter = 0
+right_perm_counter = 0
+left_perm_closed = False
+right_perm_closed = False
+
+mar_counter = 0
+yawn_alarm = False
+
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = detector(gray)
+
+    if len(faces) > 0:
+        # pick closest / largest face
+        largest = max(faces, key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()))
+
+        shape = predictor(gray, largest)
+        shape_np = np.zeros((68, 2), dtype=int)
+        for i in range(68):
+            shape_np[i] = (shape.part(i).x, shape.part(i).y)
+
+        left_eye = shape_np[LEFT_EYE]
+        right_eye = shape_np[RIGHT_EYE]
+        inner_mouth = shape_np[INNER_MOUTH]
+
+        # compute raw EAR/MAR (None if invalid)
+        leftEAR_raw = eye_aspect_ratio(left_eye)
+        rightEAR_raw = eye_aspect_ratio(right_eye)
+        mar_raw = mouth_aspect_ratio(inner_mouth)
+
+        # update smoothing buffers only when valid
+        if leftEAR_raw is not None:
+            left_ear_deque.append(leftEAR_raw)
+        if rightEAR_raw is not None:
+            right_ear_deque.append(rightEAR_raw)
+        if mar_raw is not None:
+            mar_deque.append(mar_raw)
+
+        # compute smoothed values (or None if no valid values yet)
+        smooth_leftEAR = float(np.mean(left_ear_deque)) if len(left_ear_deque) else None
+        smooth_rightEAR = float(np.mean(right_ear_deque)) if len(right_ear_deque) else None
+        smooth_mar = float(np.mean(mar_deque)) if len(mar_deque) else None
+
+        # Decide eye availability: we require at least one eye smoothing value
+        eye_available = (smooth_leftEAR is not None) or (smooth_rightEAR is not None)
+        # Decide mouth availability
+        mouth_available = (smooth_mar is not None)
+
+        # Permanent eye closure detection only if that eye has values
+        if smooth_leftEAR is not None and smooth_leftEAR < PERM_EYE_THRESH:
+            left_perm_counter += 1
+        else:
+            left_perm_counter = 0
+            left_perm_closed = False
+
+        if smooth_rightEAR is not None and smooth_rightEAR < PERM_EYE_THRESH:
+            right_perm_counter += 1
+        else:
+            right_perm_counter = 0
+            right_perm_closed = False
+
+        if left_perm_counter >= PERM_EYE_FRAMES:
+            left_perm_closed = True
+        if right_perm_counter >= PERM_EYE_FRAMES:
+            right_perm_closed = True
+
+        # choose ear value based on availability and permanent-closed flags
+        ear = None
+        if eye_available:
+            # prefer using only working eye if other marked perm-closed
+            if left_perm_closed and (smooth_rightEAR is not None):
+                ear = smooth_rightEAR
+            elif right_perm_closed and (smooth_leftEAR is not None):
+                ear = smooth_leftEAR
+            else:
+                # average only the available ones
+                vals = []
+                if smooth_leftEAR is not None:
+                    vals.append(smooth_leftEAR)
+                if smooth_rightEAR is not None:
+                    vals.append(smooth_rightEAR)
+                ear = float(np.mean(vals)) if vals else None
+
+        # Yawn detection using MAR when available
+        if mouth_available and smooth_mar > MAR_THRESH:
+            mar_counter += 1
+        else:
+            mar_counter = 0
+            yawn_alarm = False
+
+        if mar_counter >= MAR_CONSEC_FRAMES:
+            yawn_alarm = True
+
+        # Compose final decision with fallback rules:
+        # - If both eye and mouth available -> drowsy if eye_drowsy OR yawn_drowsy
+        # - If only eye available -> base on eye
+        # - If only mouth available -> base on mouth
+        # - If none available -> no decision (can't detect)
+        eye_drowsy = False
+        yawn_drowsy = False
+
+        if ear is not None:
+            if ear < EYE_AR_THRESH:
+                COUNTER += 1
+                if COUNTER >= EYE_AR_CONSEC_FRAMES:
+                    eye_drowsy = True
+            else:
+                COUNTER = 0
+        else:
+            # no valid ear reading this frame; do not increment eye counter
+            # optionally you could decay COUNTER here to avoid stale counts
+            COUNTER = max(0, COUNTER - 1)
+
+        if yawn_alarm:
+            yawn_drowsy = True
+
+        final_drowsy = False
+        # both available
+        if eye_available and mouth_available:
+            final_drowsy = eye_drowsy or yawn_drowsy
+        elif eye_available and not mouth_available:
+            final_drowsy = eye_drowsy
+        elif mouth_available and not eye_available:
+            final_drowsy = yawn_drowsy
+        else:
+            # neither available
+            final_drowsy = False
+
+        # Draw overlays
+        leftHull = cv2.convexHull(left_eye)
+        rightHull = cv2.convexHull(right_eye)
+        mouthHull = cv2.convexHull(inner_mouth)
+        cv2.drawContours(frame, [leftHull], -1, (0, 255, 0), 1)
+        cv2.drawContours(frame, [rightHull], -1, (0, 255, 0), 1)
+        cv2.drawContours(frame, [mouthHull], -1, (0, 255, 255), 1)
+
+        # show smoothed values or "NA"
+        display_left = f"{smooth_leftEAR:.2f}" if smooth_leftEAR is not None else "NA"
+        display_right = f"{smooth_rightEAR:.2f}" if smooth_rightEAR is not None else "NA"
+        display_mar = f"{smooth_mar:.2f}" if smooth_mar is not None else "NA"
+        display_ear = f"{ear:.2f}" if ear is not None else "NA"
+
+       # cv2.putText(frame, f"EAR L:{display_left} R:{display_right} Avg:{display_ear}",
+               #     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        #cv2.putText(frame, f"MAR:{display_mar}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+        # status about which signals are available
+       # avail_text = f"EyeAvail:{eye_available} MouthAvail:{mouth_available}"
+        #cv2.putText(frame, avail_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+        # Final overlay
+        if final_drowsy:
+            if not ALARM_ON:
+                ALARM_ON = True
+                # play sound / action here if needed
+            cv2.putText(frame, "DROWSY ALERT!", (100, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            reasons = []
+            if eye_drowsy:
+                reasons.append("Eyes")
+            if yawn_drowsy:
+                reasons.append("Yawn")
+            cv2.putText(frame, "Reason: " + ",".join(reasons), (100, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+        else:
+            ALARM_ON = False
+            cv2.putText(frame, "Awake", (100, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+        # bounding box
+        x1, y1, x2, y2 = largest.left(), largest.top(), largest.right(), largest.bottom()
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+    else:
+        # no detected faces - reset buffers or gradually decay
+        COUNTER = 0
+        ALARM_ON = False
+        left_ear_deque.clear(); right_ear_deque.clear(); mar_deque.clear()
+        left_perm_counter = right_perm_counter = 0
+        left_perm_closed = right_perm_closed = False
+        mar_counter = 0
+        yawn_alarm = False
+        cv2.putText(frame, "No person detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+
+    cv2.imshow("Drowsiness (fallback eye/mouth)", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
